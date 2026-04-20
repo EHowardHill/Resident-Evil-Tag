@@ -1,9 +1,9 @@
 """
-VR Webcam Viewer — Flask app that streams the default webcam
+VR Webcam Viewer — Flask app that streams the selected webcam
 and displays it in one half of a split-screen VR layout.
 
-Single feed only (no duplication artefacts). Three-finger tap
-swaps which eye (left / right panel) receives the image.
+Optimized for high-concurrency (up to 9+ devices) using Waitress,
+Condition threading, and reduced MJPEG bandwidth footprint.
 """
 
 import time
@@ -19,24 +19,37 @@ class Camera:
     """Thread-safe wrapper around a single VideoCapture instance."""
 
     def __init__(self):
-        self.lock = threading.Lock()
+        # Condition variable for zero-latency, real-time broadcasting to all 9 devices
+        self.condition = threading.Condition()
         self.frame = None
         self.cap = None
         self._running = False
+        self.camera_index = 0
 
     def start(self):
         if self._running:
             return
-        self.cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+        
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_AVFOUNDATION)
         if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap = cv2.VideoCapture(self.camera_index)
+            
+        # --- BANDWIDTH OPTIMIZATIONS FOR 9 DEVICES ---
+        # 640x480 is the sweet spot for VR over WiFi without choking the router
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        # Limit hardware capture framerate to save CPU and network bandwidth
+        self.cap.set(cv2.CAP_PROP_FPS, 24)
+        
+        # Ensure OpenCV drops old frames and only holds the newest one
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+        
         time.sleep(1)
         self._running = True
         thread = threading.Thread(target=self._capture_loop, daemon=True)
         thread.start()
-        print("[camera] capture thread started")
+        print(f"[camera] capture thread started on index {self.camera_index} (Optimized for Multi-Client)")
 
     def _capture_loop(self):
         while self._running:
@@ -44,15 +57,20 @@ class Camera:
             if not ok:
                 time.sleep(0.05)
                 continue
-            frame = cv2.flip(frame, 1)  # mirror for natural VR feel
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            with self.lock:
+            
+            # --- HORIZONTAL FLIP ---
+            frame = cv2.flip(frame, 1) 
+            
+            # --- AGGRESSIVE COMPRESSION ---
+            # 50% quality cuts file size down drastically to support 9 continuous streams
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            
+            # Instantly broadcast the new frame to all 9 waiting threads
+            with self.condition:
                 self.frame = buf.tobytes()
-        self.cap.release()
+                self.condition.notify_all()
 
-    def get_frame(self):
-        with self.lock:
-            return self.frame
+        self.cap.release()
 
 
 camera = Camera()
@@ -248,11 +266,8 @@ HTML = r"""
       });
 
       // ══════════════════════════════════════════════════════════
-      //  KEEP THE SCREEN ON — two independent strategies so at
-      //  least one works on every browser / OS combination.
+      //  KEEP THE SCREEN ON
       // ══════════════════════════════════════════════════════════
-
-      // Strategy 1 — Wake Lock API (Chrome 84+, Edge 84+, Safari 16.4+)
       var wakeLock = null;
 
       async function acquireWakeLock() {
@@ -272,44 +287,29 @@ HTML = r"""
 
       acquireWakeLock();
 
-      // Re-acquire when the page becomes visible (browsers release
-      // the lock automatically when the tab is backgrounded).
       $(document).on('visibilitychange', function () {
         if (document.visibilityState === 'visible') acquireWakeLock();
       });
 
-      // Re-acquire on any user interaction (some browsers need a
-      // fresh gesture to grant the lock after it was released).
       $(document).on('click touchstart', function () {
         if (!wakeLock) acquireWakeLock();
       });
 
-      // Poll every 10 s as a final safety net.
       setInterval(function () {
         if (!wakeLock && document.visibilityState === 'visible') {
           acquireWakeLock();
         }
       }, 10000);
 
-      // Strategy 2 — hidden <video> loop ("NoSleep" technique).
-      // Works on older iOS Safari and Android WebViews that lack
-      // the Wake Lock API.  A tiny silent MP4 plays in a 1 px
-      // invisible element; the browser treats it as active media
-      // and refuses to sleep.
       (function noSleepVideo() {
-        // Use this as a FALLBACK even when Wake Lock exists,
-        // because some devices still sleep through it.
         console.log('[wake] starting video-loop fallback');
-
         var v = document.createElement('video');
         v.setAttribute('playsinline', '');
         v.setAttribute('muted', '');
         v.muted = true;
         v.setAttribute('loop', '');
-        v.style.cssText =
-          'position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0.01;pointer-events:none';
+        v.style.cssText = 'position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0.01;pointer-events:none';
 
-        // Minimal valid silent MP4 (~ 1 kB, loops forever)
         v.src = 'data:video/mp4;base64,' +
           'AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAADht' +
           'ZGF0AAAC0AYF//+s3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NC' +
@@ -320,12 +320,8 @@ HTML = r"""
           'ZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPAAAAAAAEAAAAAAA==';
 
         document.body.appendChild(v);
-
         function tryPlay() { v.play().catch(function () {}); }
         tryPlay();
-
-        // Re-trigger on every user gesture (iOS often pauses
-        // background media and needs a fresh interaction).
         $(document).on('click touchstart', tryPlay);
       })();
 
@@ -347,16 +343,25 @@ HTML = r"""
 def gen_frames():
     """Yield JPEG frames from the shared camera as an MJPEG stream."""
     camera.start()
-    while True:
-        frame = camera.get_frame()
-        if frame is None:
-            time.sleep(0.05)
-            continue
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
-        )
-        time.sleep(0.033)  # ~30 fps cap
+    
+    try:
+        while True:
+            # Server completely pauses here until hardware has a new frame
+            with camera.condition:
+                camera.condition.wait()
+                frame = camera.frame
+                
+            if frame is None:
+                continue
+                
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+            )
+    except GeneratorExit:
+        # Prevents thread-lock if a user refreshes or closes their browser
+        print("[server] Client disconnected cleanly.")
+        pass
 
 
 @app.route('/')
@@ -372,5 +377,50 @@ def video_feed():
     )
 
 
+# ── Terminal UI / Startup ────────────────────────────────────────
+def select_camera_cli():
+    print("Scanning for available webcams (this may take a moment)...")
+    available_cams = []
+    
+    for i in range(5):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                available_cams.append(i)
+        cap.release()
+
+    if not available_cams:
+        print("\n[!] No webcams detected. Defaulting to index 0.")
+        return 0
+
+    print("\n--- Available Webcams ---")
+    for cam_idx in available_cams:
+        print(f"  [{cam_idx}] Camera {cam_idx}")
+    print("-------------------------")
+
+    while True:
+        choice = input(f"\nSelect a camera index (default {available_cams[0]}): ").strip()
+        
+        if not choice:
+            return available_cams[0]
+        
+        try:
+            choice_int = int(choice)
+            if choice_int not in available_cams:
+                print(f"Warning: Camera {choice_int} wasn't detected in the scan, but attempting to use it anyway.")
+            return choice_int
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, threaded=True)
+    from waitress import serve
+    
+    selected_index = select_camera_cli()
+    camera.camera_index = selected_index
+    
+    print(f"\n[server] Starting high-concurrency server on http://0.0.0.0:8000 (Targeting Camera {selected_index})...")
+    
+    # 16 threads provide plenty of headroom for 9 active devices plus intermittent reconnects
+    serve(app, host='0.0.0.0', port=8000, threads=16)
